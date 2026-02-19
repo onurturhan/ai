@@ -1,0 +1,7 @@
+model = "o4-mini"
+sandbox_permissions = ["workspace-write"]
+shell_environment_policy = { inherit = "all" }
+
+[features]
+experimental = false
+
