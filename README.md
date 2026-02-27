@@ -9,7 +9,7 @@ This repository provides a bootstrap script to launch a multi-AI CLI tmux worksp
 The script **must be sourced**, not executed directly, because it sets environment variables and aliases in the calling shell:
 
 ```bash
-source setup_ai.sh
+source ai.sh
 ```
 
 After setup, reattach to the workspace at any time with:
@@ -31,7 +31,7 @@ tmux attach -t ai
 
 ## Architecture
 
-### `setup_ai.sh`
+### `ai.sh`
 
 Single idempotent setup script that:
 1. Configures npm global prefix to `~/.npm-global` (avoids sudo).
