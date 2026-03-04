@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Usage: cb() { ~/Workspace/ai/cb.sh "$*"; }  # add this to ~/.bashrc
+# Usage: cb() { ~/Workspace/Ai/cb.sh "$*"; }  # add this to ~/.bashrc
 # Then: cb "cfs && git pull"
 
 # Function to restore eusb connection

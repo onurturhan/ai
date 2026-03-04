@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Usage: bb() { ~/Workspace/ai/bb.sh; }  # add this to ~/.bashrc
+# Usage: bb() { ~/Workspace/Ai/bb.sh; }  # add this to ~/.bashrc
 # Then: bb  (toggles between eno1 and eusb)
 
 if nmcli connection show --active | grep -q "eusb"; then
