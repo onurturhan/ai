@@ -56,3 +56,7 @@ unzip SourceCodePro.zip
 fc-cache -fv
 
 
+
+sudo dnf install telnet
+telnet mapscii.me
+

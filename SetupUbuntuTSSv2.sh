@@ -24,7 +24,15 @@
 #     as this script (ubuntu-22.04*desktop*amd64.iso)
 #
 # ==========================================================
-#  virsh destroy UbuntuTSS 2>/dev/null; virsh undefine UbuntuTSS --nvram 2>/dev/null || virsh undefine UbuntuTSS; sudo rm -f /var/lib/libvirt/images/UbuntuTSS.qcow2
+
+#export LIBVIRT_DEFAULT_URI="qemu:///system"
+#vvirsh destroy UbuntuTSS 2>/dev/null || true
+#virsh undefine UbuntuTSS --nvram 2>/dev/null || virsh undefine UbuntuTSS
+#sudo rm -f /var/lib/libvirt/images/UbuntuTSS.qcow2
+#rm -f ~/Workspace/Ai/seed.iso ~/Workspace/Ai/user-data ~/Workspace/Ai/meta-data
+
+#export LIBVIRT_DEFAULT_URI="qemu:///system"
+#virt-viewer UbuntuTSS
 
 set -euo pipefail
 
@@ -32,7 +40,7 @@ set -euo pipefail
 # Logging
 # ==========================================================
 
-LOG_FILE="./kvm-setup-$(date +%Y%m%d-%H%M%S).log"
+LOG_FILE="$HOME/kvm-setup-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -60,6 +68,48 @@ wait_for_network() {
     die "Network did not become available after $(( TRIES * WAIT ))s. Check bridge/DNS config."
 }
 
+# Wait until SSH is reachable on the VM after autoinstall completes.
+wait_for_ssh() {
+    local IP="$1"
+    log "== Waiting for SSH on $IP =="
+    local TRIES=60
+    local WAIT=10
+    for (( i=1; i<=TRIES; i++ )); do
+        if ssh -o StrictHostKeyChecking=no \
+               -o ConnectTimeout=5 \
+               -o BatchMode=yes \
+               "$USERNAME@$IP" "echo ok" &>/dev/null; then
+            log "SSH is up on $IP."
+            return 0
+        fi
+        log "SSH not ready yet — attempt $i/$TRIES, retrying in ${WAIT}s..."
+        sleep "$WAIT"
+    done
+    warn "SSH did not become available after $(( TRIES * WAIT ))s."
+    warn "VM may still be installing. Try: ssh $USERNAME@$IP"
+}
+
+# Build seed ISO for autoinstall using genisoimage.
+make_seed_iso() {
+    local OUTPUT="$1" USERDATA="$2" METADATA="$3"
+    if command -v cloud-localds &>/dev/null; then
+        log "Creating seed ISO with cloud-localds."
+        cloud-localds "$OUTPUT" "$USERDATA" "$METADATA" \
+            || die "cloud-localds failed."
+    elif command -v genisoimage &>/dev/null; then
+        log "Creating seed ISO with genisoimage."
+        genisoimage \
+            -output "$OUTPUT" \
+            -volid cidata \
+            -joliet \
+            -rock \
+            "$USERDATA" "$METADATA" \
+            || die "genisoimage failed."
+    else
+        die "Neither cloud-localds nor genisoimage found. Cannot create seed ISO."
+    fi
+}
+
 
 
 # ==========================================================
@@ -73,9 +123,14 @@ DISK_GB=100
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VM_STORAGE_DIR="/var/lib/libvirt/images"
 
+# Desktop ISO is used with autoinstall for unattended setup.
+# ubuntu-desktop is already included — no separate server ISO needed.
 UBUNTU_ISO_NAME="ubuntu-22.04.5-desktop-amd64.iso"
 UBUNTU_ISO_URL="https://releases.ubuntu.com/22.04/$UBUNTU_ISO_NAME"
 UBUNTU_ISO="$SCRIPT_DIR/$UBUNTU_ISO_NAME"
+
+USERNAME="rtems"
+PASSWORD="rtems"
 
 NEED_REBOOT=0
 
@@ -137,11 +192,11 @@ if [[ "$PM" == "apt" ]]; then
         || die "apt-get update failed."
     sudo apt-get install -y \
         qemu-kvm libvirt-daemon-system libvirt-clients \
-        virt-install virt-viewer bridge-utils curl \
+        virt-install virt-viewer bridge-utils curl genisoimage \
         || die "apt-get install of virtualization packages failed."
 else
     sudo "$PM" install -y \
-        qemu-kvm libvirt virt-install virt-viewer bridge-utils curl NetworkManager \
+        qemu-kvm libvirt virt-install virt-viewer bridge-utils curl NetworkManager genisoimage \
         || die "dnf/yum install of base virtualization packages failed."
 fi
 
@@ -374,13 +429,71 @@ else
         || die "qemu-img disk creation failed."
 
     # ==========================================================
-    # Create VM — boot from Desktop ISO for interactive install.
-    # Connect via SPICE to complete the Ubuntu GUI installer.
-    # --noautoconsole lets the script continue to USB attachment
-    # while the installer runs in the background.
+    # Build autoinstall seed ISO
+    # Ubuntu subiquity reads user-data from a cidata-labeled ISO.
+    # The autoinstall config sets up the user, SSH, packages,
+    # and i386 libs — no manual interaction needed.
     # ==========================================================
 
-    log "== Creating VM and booting Ubuntu Desktop installer =="
+    log "== Building autoinstall seed ISO =="
+
+    # Generate SHA-512 password hash for rtems
+    PASSWORD_HASH=$(python3 -c \
+        "import crypt,os; print(crypt.crypt('$PASSWORD', crypt.mksalt(crypt.METHOD_SHA512)))" \
+        2>/dev/null) || die "python3 required to hash password."
+
+    cat > "$SCRIPT_DIR/user-data" <<EOF
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  identity:
+    hostname: $VM_NAME
+    username: $USERNAME
+    password: "$PASSWORD_HASH"
+  ssh:
+    install-server: true
+    allow-pw: true
+  packages:
+    - build-essential
+    - git
+    - curl
+    - htop
+    - net-tools
+    - can-utils
+  late-commands:
+    - dpkg-reconfigure -f noninteractive tzdata
+    - dpkg --add-architecture i386
+    - apt-get install -y libc6:i386 libncurses5:i386 libstdc++6:i386
+    - echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /target/etc/sudoers.d/$USERNAME
+    - chmod 440 /target/etc/sudoers.d/$USERNAME
+  storage:
+    layout:
+      name: direct
+  user-data:
+    chpasswd:
+      expire: false
+EOF
+
+    cat > "$SCRIPT_DIR/meta-data" <<EOF
+instance-id: $VM_NAME
+local-hostname: $VM_NAME
+EOF
+
+    chmod 600 "$SCRIPT_DIR/user-data" "$SCRIPT_DIR/meta-data"
+    make_seed_iso "$SCRIPT_DIR/seed.iso" "$SCRIPT_DIR/user-data" "$SCRIPT_DIR/meta-data"
+    chmod 600 "$SCRIPT_DIR/seed.iso"
+
+    # ==========================================================
+    # Create VM — boot server ISO with autoinstall kernel arg.
+    # --location extracts kernel/initrd so we can pass extra-args.
+    # seed.iso (cidata) is attached as second cdrom for user-data.
+    # --noautoconsole returns immediately; install runs in bg.
+    # ==========================================================
+
+    log "== Creating VM and starting unattended install =="
 
     virt-install \
         --name "$VM_NAME" \
@@ -390,17 +503,38 @@ else
         --machine q35 \
         --os-variant ubuntu22.04 \
         --disk path="$VM_STORAGE_DIR/${VM_NAME}.qcow2",format=qcow2,bus=virtio,size="$DISK_GB" \
-        --cdrom "$UBUNTU_ISO" \
+        --disk path="$SCRIPT_DIR/seed.iso",device=cdrom,readonly=on \
+        --location "$UBUNTU_ISO,kernel=casper/vmlinuz,initrd=casper/initrd" \
+        --extra-args "autoinstall quiet" \
         --network network=default,model=virtio \
         --network bridge=br0,model=virtio \
         --graphics spice,listen=0.0.0.0 \
         --video qxl \
-        --boot cdrom,hd \
         --noautoconsole \
         || die "virt-install failed."
 
-    log "VM created. Connect via SPICE to complete the Ubuntu installation."
-    log "Use: virt-viewer $VM_NAME  OR  remote-viewer spice://<host-ip>:5900"
+    log "Unattended install started. Waiting for VM to get an IP..."
+
+    # Poll until the VM gets a DHCP lease on the default NAT network
+    VM_IP=""
+    for (( i=1; i<=30; i++ )); do
+        VM_IP=$(virsh domifaddr "$VM_NAME" 2>/dev/null \
+            | awk '/ipv4/{gsub(/\/[0-9]+/,"",$4); print $4}' | head -1)
+        [[ -n "$VM_IP" ]] && break
+        log "Waiting for VM IP — attempt $i/30..."
+        sleep 10
+    done
+
+    if [[ -n "$VM_IP" ]]; then
+        log "VM IP: $VM_IP"
+        log "Installation is running. This takes 5-15 minutes."
+        log "You can monitor progress with: virsh console $VM_NAME"
+        log "SSH will become available after install completes."
+        wait_for_ssh "$VM_IP"
+    else
+        warn "Could not determine VM IP yet — install may still be running."
+        warn "Check with: virsh domifaddr $VM_NAME"
+    fi
 
 fi  # end idempotency block
 
@@ -413,7 +547,18 @@ log "== Adding USB passthrough definitions =="
 for entry in "${USB_DEVICES[@]}"; do
     read -r DEV_NAME VENDOR_ID PRODUCT_ID COUNT KMOD <<< "$entry"
 
-    for (( i=1; i<=COUNT; i++ )); do
+    # Count how many instances of this device are already attached.
+    ALREADY=$(virsh dumpxml "$VM_NAME" 2>/dev/null \
+        | grep -c "vendor id='$VENDOR_ID'" || true)
+
+    if (( ALREADY >= COUNT )); then
+        log "$DEV_NAME already has $ALREADY/$COUNT instance(s) attached — skipping."
+        continue
+    fi
+
+    ATTACH_FROM=$(( ALREADY + 1 ))
+
+    for (( i=ATTACH_FROM; i<=COUNT; i++ )); do
         XML_FILE="$SCRIPT_DIR/usb_${DEV_NAME}_${i}.xml"
 
         cat > "$XML_FILE" <<EOF
@@ -441,11 +586,14 @@ echo ""
 echo "================================================="
 echo "VM setup complete."
 echo ""
-echo "Ubuntu Desktop installer is running in the VM."
-echo "Connect via SPICE to complete the installation:"
-echo "  virt-viewer $VM_NAME"
-echo "  -- or --"
-echo "  remote-viewer spice://<host-ip>:5900"
+echo "VM credentials:  $USERNAME / $PASSWORD"
+echo ""
+echo "Unattended Ubuntu install is running (5-15 min)."
+echo "Monitor install progress with:"
+echo "  virsh console $VM_NAME   (Ctrl+] to exit)"
+echo ""
+echo "Once install completes, connect via SSH:"
+echo "  ssh $USERNAME@\$(virsh domifaddr $VM_NAME | awk '/ipv4/{gsub(/\\/[0-9]+/,\"\",\$4); print \$4}')"
 echo ""
 echo "Networks configured:"
 echo "  - NAT (default)"
@@ -465,16 +613,11 @@ for entry in "${USB_DEVICES[@]}"; do
     fi
 done
 echo ""
-echo "After completing the Ubuntu GUI installer, run the"
-echo "following inside the VM to install required packages:"
+echo "Packages installed automatically in VM:"
+echo "  build-essential git curl htop net-tools can-utils"
+echo "  libc6:i386 libncurses5:i386 libstdc++6:i386"
 echo ""
-echo "  sudo dpkg --add-architecture i386"
-echo "  sudo apt-get update && sudo apt-get upgrade -y"
-echo "  sudo apt-get install -y \\"
-echo "    build-essential git curl htop net-tools can-utils \\"
-echo "    libc6:i386 libncurses5:i386 libstdc++6:i386"
-echo ""
-echo "After installation is complete, find VM IP with:"
+echo "Find VM IP with:"
 echo "  virsh domifaddr $VM_NAME"
 echo ""
 echo "Full setup log saved to:"
